@@ -149,7 +149,7 @@ func datasetSourceInfo(
 		return "", "", false, err
 	}
 
-	sourceURL, sourceURLField, exists, err := datasetStringField(
+	sourceURL, _, exists, err := datasetStringField(
 		values,
 		"source_url",
 		"sourceUrl",
@@ -165,14 +165,6 @@ func datasetSourceInfo(
 		)
 	}
 
-	if err := validateDatasetSourceURL(sourceURL); err != nil {
-		return "", "", false, fmt.Errorf(
-			`dataset body field %q: %w`,
-			sourceURLField,
-			err,
-		)
-	}
-
 	expectedSHA256, _, hasSHA256, err := datasetStringField(
 		values,
 		"source_sha256",
@@ -182,8 +174,8 @@ func datasetSourceInfo(
 		return "", "", false, err
 	}
 
-	// An omitted or empty checksum disables validation. The checksum is
-	// still calculated by streamDatasetToUpload.
+	// An empty checksum disables verification. The provider still calculates
+	// and exposes the actual checksum in output.computed_sha256.
 	if !hasSHA256 || strings.TrimSpace(expectedSHA256) == "" {
 		return sourceURL, "", false, nil
 	}
@@ -204,44 +196,6 @@ func datasetSourceInfo(
 	}
 
 	return sourceURL, expectedSHA256, true, nil
-}
-
-func validateDatasetSourceURL(rawURL string) error {
-	parsedURL, err := url.ParseRequestURI(rawURL)
-	if err != nil {
-		return fmt.Errorf("must be an HTTPS URL")
-	}
-
-	if !strings.EqualFold(parsedURL.Scheme, "https") ||
-		parsedURL.Hostname() == "" ||
-		parsedURL.User != nil ||
-		parsedURL.Fragment != "" ||
-		(parsedURL.Port() != "" && parsedURL.Port() != "443") {
-		return fmt.Errorf("must be an HTTPS URL")
-	}
-
-	host := strings.ToLower(parsedURL.Hostname())
-
-	if host == "raw.github.kp.org" || isAzureBlobHost(host) {
-		return nil
-	}
-
-	return fmt.Errorf(
-		"must use raw.github.kp.org or an Azure Blob Storage host",
-	)
-}
-
-func isAzureBlobHost(host string) bool {
-	for _, suffix := range []string{
-		".blob.core.windows.net",
-	} {
-		if strings.HasSuffix(host, suffix) &&
-			len(host) > len(suffix) {
-			return true
-		}
-	}
-
-	return false
 }
 
 func datasetPendingUploadBody(
@@ -476,13 +430,6 @@ func datasetUploadDetails(
 		return "", "", err
 	}
 
-	if err := validateDatasetSASURL(uploadURL); err != nil {
-		return "", "", fmt.Errorf(
-			"dataset response field blobReference.credential.sasUri: %w",
-			err,
-		)
-	}
-
 	dataURIValues := values
 
 	if consumption, ok := values["blobReferenceForConsumption"]; ok &&
@@ -504,20 +451,9 @@ func datasetUploadDetails(
 	return uploadURL, dataURI, nil
 }
 
-func validateDatasetSASURL(rawURL string) error {
-	parsedURL, err := url.Parse(rawURL)
-	if err != nil ||
-		!strings.EqualFold(parsedURL.Scheme, "https") ||
-		parsedURL.Hostname() == "" ||
-		parsedURL.RawQuery == "" {
-		return fmt.Errorf("must be an HTTPS SAS URL")
-	}
-
-	return nil
-}
-
 func datasetSourceFilename(sourceURL string) (string, error) {
 	parsedURL, err := url.Parse(sourceURL)
+	// err is always non-nil for invalid URLs.
 	if err != nil {
 		return "", fmt.Errorf("parsing source_url: %w", err)
 	}
@@ -562,41 +498,16 @@ func datasetBlobUploadURL(
 }
 
 func datasetSourceHTTPClient() *http.Client {
-	return &http.Client{
-		CheckRedirect: func(
-			request *http.Request,
-			_ []*http.Request,
-		) error {
-			if err := validateDatasetSourceURL(request.URL.String()); err != nil {
-				return fmt.Errorf(
-					"refusing redirect for source_url: %w",
-					err,
-				)
-			}
-
-			return nil
-		},
-	}
+	// URL allowlisting is handled by the Terraform module.
+	// The default client also permits redirects from source repositories.
+	return &http.Client{}
 }
 
 func datasetUploadHTTPClient() *http.Client {
-	return &http.Client{
-		CheckRedirect: func(
-			*http.Request,
-			[]*http.Request,
-		) error {
-			return fmt.Errorf(
-				"refusing redirect from dataset upload SAS URL",
-			)
-		},
-	}
+	return &http.Client{}
 }
 
 func downloadDatasetSHA256(sourceURL string) (string, error) {
-	if err := validateDatasetSourceURL(sourceURL); err != nil {
-		return "", err
-	}
-
 	request, err := http.NewRequestWithContext(
 		context.Background(),
 		http.MethodGet,
@@ -1036,8 +947,7 @@ func (c FoundryDatasetCustomization) AugmentReadOutput(
 		return responseBody, nil
 	}
 
-	// Keep a checksum already produced during create or returned by a
-	// previous response.
+	// Preserve a checksum already added by another response-processing step.
 	if _, _, exists := datasetField(
 		outputValues,
 		"computed_sha256",
@@ -1049,21 +959,28 @@ func (c FoundryDatasetCustomization) AugmentReadOutput(
 		stateBody,
 	)
 	if err != nil {
-		// For imported resources or state without source_url, preserve the
-		// API response and do not fail a normal read.
+		// This can occur for imported resources whose state does not contain
+		// the provider-specific source_url field.
 		return outputValues, nil
 	}
 
-	computedSHA256 := expectedSHA256
+	// Always calculate the actual checksum. source_sha256 is only the
+	// expected checksum used for validation.
+	computedSHA256, err := downloadDatasetSHA256(sourceURL)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"calculating dataset SHA-256 for output: %w",
+			err,
+		)
+	}
 
-	if !verifySHA256 {
-		computedSHA256, err = downloadDatasetSHA256(sourceURL)
-		if err != nil {
-			return nil, fmt.Errorf(
-				"calculating dataset SHA-256 for output: %w",
-				err,
-			)
-		}
+	if verifySHA256 &&
+		!strings.EqualFold(computedSHA256, expectedSHA256) {
+		return nil, fmt.Errorf(
+			"dataset SHA-256 mismatch during read: expected %s, got %s",
+			expectedSHA256,
+			computedSHA256,
+		)
 	}
 
 	outputValues["computed_sha256"] = computedSHA256
