@@ -219,6 +219,16 @@ func (client *DataPlaneClient) DeleteThenPoll(ctx context.Context, id parse.Data
 }
 
 func (client *DataPlaneClient) Action(ctx context.Context, resourceID string, action string, apiVersion string, method string, body interface{}, options RequestOptions) (interface{}, error) {
+	return client.action(ctx, resourceID, action, apiVersion, method, body, options, "")
+}
+
+// ActionWithContentType invokes a data-plane action with a specific request
+// content type.
+func (client *DataPlaneClient) ActionWithContentType(ctx context.Context, resourceID string, action string, apiVersion string, method string, body interface{}, options RequestOptions, contentType string) (interface{}, error) {
+	return client.action(ctx, resourceID, action, apiVersion, method, body, options, contentType)
+}
+
+func (client *DataPlaneClient) action(ctx context.Context, resourceID string, action string, apiVersion string, method string, body interface{}, options RequestOptions, contentType string) (interface{}, error) {
 	// build request
 	if options.RetryOptions != nil {
 		ctx = policy.WithRetryOptions(ctx, *options.RetryOptions)
@@ -243,6 +253,9 @@ func (client *DataPlaneClient) Action(ctx context.Context, resourceID string, ac
 	}
 	if method != "GET" && body != nil {
 		err = runtime.MarshalAsJSON(req, body)
+		if err == nil && contentType != "" {
+			req.Raw().Header.Set("Content-Type", contentType)
+		}
 	}
 	if err != nil {
 		return nil, err
@@ -272,15 +285,15 @@ func (client *DataPlaneClient) Action(ctx context.Context, resourceID string, ac
 
 	// unmarshal response
 	var responseBody interface{}
-	contentType := resp.Header.Get("Content-Type")
+	responseContentType := resp.Header.Get("Content-Type")
 	switch {
-	case strings.Contains(contentType, "text/plain"):
+	case strings.Contains(responseContentType, "text/plain"):
 		payload, err := runtime.Payload(resp)
 		if err != nil {
 			return nil, err
 		}
 		responseBody = string(payload)
-	case strings.Contains(contentType, "application/json"):
+	case strings.Contains(responseContentType, "application/json"):
 		if err := runtime.UnmarshalAsJSON(resp, &responseBody); err != nil {
 			return nil, err
 		}
