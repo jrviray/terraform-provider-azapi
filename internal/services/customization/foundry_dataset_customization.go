@@ -886,7 +886,40 @@ func (c FoundryDatasetCustomization) UpdateFunc() UpdateFunc {
 }
 
 func (c FoundryDatasetCustomization) DeleteFunc() DeleteFunc {
-	return nil
+	return func(
+		ctx context.Context,
+		client clients.Client,
+		id parse.DataPlaneResourceId,
+		options clients.RequestOptions,
+	) error {
+		// Deletes only the Foundry dataset version:
+		//
+		// DELETE {id.AzureResourceId}?api-version={id.ApiVersion}
+		//
+		// The uploaded blob is intentionally not deleted.
+		_, err := client.DataPlaneClient.ActionWithContentType(
+			ctx,
+			id.AzureResourceId,
+			"",
+			id.ApiVersion,
+			http.MethodDelete,
+			nil,
+			options,
+			"application/json",
+		)
+		if err != nil {
+			return fmt.Errorf(
+				"deleting Foundry dataset version %q: %w",
+				id.Name,
+				err,
+			)
+		}
+
+		// Foundry returns HTTP 204 No Content on success. The data-plane
+		// client handles the empty response, and Terraform removes the
+		// resource from state after this function returns nil.
+		return nil
+	}
 }
 
 func (c FoundryDatasetCustomization) StateBodyFunc() StateBodyFunc {
