@@ -498,8 +498,8 @@ func datasetBlobUploadURL(
 }
 
 func datasetSourceHTTPClient() *http.Client {
-	// URL allowlisting is handled by the Terraform module.
-	// The default client also permits redirects from source repositories.
+	// Source URL allowlisting is handled by Terraform module validation.
+	// The provider only downloads the URL supplied in the resource body.
 	return &http.Client{}
 }
 
@@ -825,7 +825,7 @@ func (c FoundryDatasetCustomization) createOrUpdate(
 		)
 	}
 
-	// This value is placed in output, not body.
+	// computed_sha256 belongs in output, not body.
 	responseValues, err := datasetMap(responseBody)
 	if err != nil {
 		return nil, fmt.Errorf(
@@ -886,40 +886,7 @@ func (c FoundryDatasetCustomization) UpdateFunc() UpdateFunc {
 }
 
 func (c FoundryDatasetCustomization) DeleteFunc() DeleteFunc {
-	return func(
-		ctx context.Context,
-		client clients.Client,
-		id parse.DataPlaneResourceId,
-		options clients.RequestOptions,
-	) error {
-		// Deletes only the Foundry dataset version:
-		//
-		// DELETE {id.AzureResourceId}?api-version={id.ApiVersion}
-		//
-		// The uploaded blob is intentionally not deleted.
-		_, err := client.DataPlaneClient.ActionWithContentType(
-			ctx,
-			id.AzureResourceId,
-			"",
-			id.ApiVersion,
-			http.MethodDelete,
-			nil,
-			options,
-			"application/json",
-		)
-		if err != nil {
-			return fmt.Errorf(
-				"deleting Foundry dataset version %q: %w",
-				id.Name,
-				err,
-			)
-		}
-
-		// Foundry returns HTTP 204 No Content on success. The data-plane
-		// client handles the empty response, and Terraform removes the
-		// resource from state after this function returns nil.
-		return nil
-	}
+	return nil
 }
 
 func (c FoundryDatasetCustomization) StateBodyFunc() StateBodyFunc {
@@ -980,7 +947,7 @@ func (c FoundryDatasetCustomization) AugmentReadOutput(
 		return responseBody, nil
 	}
 
-	// Preserve a checksum already added by another response-processing step.
+	// Preserve a checksum already returned by another provider operation.
 	if _, _, exists := datasetField(
 		outputValues,
 		"computed_sha256",
@@ -988,32 +955,21 @@ func (c FoundryDatasetCustomization) AugmentReadOutput(
 		return outputValues, nil
 	}
 
-	sourceURL, expectedSHA256, verifySHA256, err := datasetSourceInfo(
-		stateBody,
-	)
+	sourceURL, _, _, err := datasetSourceInfo(stateBody)
 	if err != nil {
-		// This can occur for imported resources whose state does not contain
-		// the provider-specific source_url field.
+		// Imported resources or older state may not contain source_url.
+		// The missing checksum must not prevent refresh or deletion.
+		outputValues["computed_sha256"] = nil
 		return outputValues, nil
 	}
 
-	// Always calculate the actual checksum. source_sha256 is only the
-	// expected checksum used for validation.
+	// Calculate the checksum for output. This is best effort during reads:
+	// source_url can expire, be deleted, or become unavailable after the
+	// Azure AI asset has already been created.
 	computedSHA256, err := downloadDatasetSHA256(sourceURL)
 	if err != nil {
-		return nil, fmt.Errorf(
-			"calculating dataset SHA-256 for output: %w",
-			err,
-		)
-	}
-
-	if verifySHA256 &&
-		!strings.EqualFold(computedSHA256, expectedSHA256) {
-		return nil, fmt.Errorf(
-			"dataset SHA-256 mismatch during read: expected %s, got %s",
-			expectedSHA256,
-			computedSHA256,
-		)
+		outputValues["computed_sha256"] = nil
+		return outputValues, nil
 	}
 
 	outputValues["computed_sha256"] = computedSHA256
